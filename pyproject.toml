@@ -1,0 +1,9 @@
+[project]
+name = "repl-nix-workspace"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "highrise-bot-sdk>=25.1.0",
+    "yt-dlp>=2026.3.17",
+]
