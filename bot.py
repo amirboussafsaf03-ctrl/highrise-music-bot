@@ -10,8 +10,20 @@ Commands (in room chat):
 Pipeline:
     1. yt-dlp resolves a track and gives us a direct audio URL.
     2. ffmpeg pulls that audio URL in real-time and pushes a 128 kbps
-       MP3 stream to the Icecast source URL in $ZENO_SOURCE_URL.
+       MP3 stream to the Icecast mount.
     3. When ffmpeg exits we advance to the next queued track.
+
+Environment variables (Railway style):
+    HIGHRISE_TOKEN   or  HIGHRISE_BOT_TOKEN  — bot API token
+    ROOM_ID          or  HIGHRISE_ROOM_ID    — target room ID
+    ICECAST_HOST     — Icecast server hostname
+    ICECAST_PORT     — Icecast server port (default 80)
+    ICECAST_PASSWORD — source password
+    ICECAST_MOUNT    — mount path, e.g. /stream
+    ICECAST_USER     — source username (default: source)
+
+    Alternatively, set ZENO_SOURCE_URL=icecast://user:pass@host:port/mount
+    to configure Icecast in a single URL (overrides individual vars above).
 """
 
 from __future__ import annotations
@@ -19,13 +31,26 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse, unquote
 
 from highrise import BaseBot, User
-from highrise.models import SessionMetadata
-from highrise.__main__ import BotDefinition, main as highrise_main
+
+try:
+    from highrise.models import SessionMetadata
+except ImportError:
+    try:
+        from highrise import SessionMetadata  # type: ignore[attr-defined,no-redef]
+    except ImportError:
+        SessionMetadata = object  # type: ignore[assignment,misc]
+
+try:
+    from highrise.__main__ import BotDefinition, main as highrise_main
+except ImportError:
+    from highrise import BotDefinition, main as highrise_main  # type: ignore[attr-defined,no-redef]
+
 from yt_dlp import YoutubeDL
 
 
@@ -65,7 +90,6 @@ class Player:
 
 @dataclass
 class IcecastTarget:
-    """Parsed icecast://user:pass@host:port/mount source URL."""
     user: str
     password: str
     host: str
@@ -93,10 +117,46 @@ def parse_icecast_url(url: str) -> IcecastTarget:
     mount = parsed.path or "/"
     if not mount.startswith("/"):
         mount = "/" + mount
-    return IcecastTarget(
-        user=user, password=password,
-        host=parsed.hostname, port=port, mount=mount,
-    )
+    return IcecastTarget(user=user, password=password,
+                         host=parsed.hostname, port=port, mount=mount)
+
+
+def build_target_from_env() -> IcecastTarget:
+    """Build an IcecastTarget from environment variables.
+
+    Precedence:
+    1. ZENO_SOURCE_URL  (single icecast:// URL)
+    2. Individual vars: ICECAST_HOST, ICECAST_PORT, ICECAST_PASSWORD,
+                        ICECAST_MOUNT, ICECAST_USER
+    """
+    source_url = os.environ.get("ZENO_SOURCE_URL", "").strip()
+    if source_url:
+        return parse_icecast_url(source_url)
+
+    host = os.environ.get("ICECAST_HOST", "").strip()
+    password = os.environ.get("ICECAST_PASSWORD", "").strip()
+    mount = os.environ.get("ICECAST_MOUNT", "/stream").strip()
+    user = os.environ.get("ICECAST_USER", "source").strip()
+    port_str = os.environ.get("ICECAST_PORT", "80").strip()
+
+    if not host:
+        raise SystemExit(
+            "Icecast not configured. Set either ZENO_SOURCE_URL or "
+            "ICECAST_HOST + ICECAST_PORT + ICECAST_PASSWORD + ICECAST_MOUNT."
+        )
+    if not password:
+        raise SystemExit("ICECAST_PASSWORD must be set.")
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        raise SystemExit(f"ICECAST_PORT must be an integer, got: {port_str!r}")
+
+    if not mount.startswith("/"):
+        mount = "/" + mount
+
+    return IcecastTarget(user=user, password=password,
+                         host=host, port=port, mount=mount)
 
 
 def resolve_track(query: str, requested_by: str) -> Optional[Track]:
@@ -121,7 +181,6 @@ def resolve_track(query: str, requested_by: str) -> Optional[Track]:
         )
         audio_url = info.get("url")
         if not audio_url:
-            # Fallback: pick the best audio-only stream from formats.
             formats = info.get("formats") or []
             audio_only = [
                 f for f in formats
@@ -140,7 +199,8 @@ def resolve_track(query: str, requested_by: str) -> Optional[Track]:
             duration=duration,
             requested_by=requested_by,
         )
-    except Exception:
+    except Exception as exc:
+        print(f"[resolve] error: {exc!r}")
         return None
 
 
@@ -151,9 +211,7 @@ class DJBot(BaseBot):
         self.player = Player()
         self._lock = asyncio.Lock()
 
-    # ---------- Lifecycle ----------
-
-    async def on_start(self, session_metadata: SessionMetadata) -> None:
+    async def on_start(self, session_metadata: SessionMetadata) -> None:  # type: ignore[override]
         await self.highrise.chat(
             "DJ bot online. Commands: !play <url|query>, !skip, !stop, !queue"
         )
@@ -175,25 +233,19 @@ class DJBot(BaseBot):
         elif cmd == "!queue":
             await self.cmd_queue(user)
 
-    # ---------- Commands ----------
-
     async def cmd_play(self, user: User, arg: str) -> None:
         if not arg:
             await self.highrise.chat("Usage: !play <youtube url or search query>")
             return
-
         await self.highrise.chat(f"Searching: {arg[:80]}")
-
         track = await asyncio.to_thread(resolve_track, arg, user.username)
         if track is None:
             await self.highrise.chat("Could not find that track.")
             return
-
         async with self._lock:
             self.player.queue.append(track)
             position = len(self.player.queue)
             should_start = self.player.current is None
-
         if should_start:
             await self._advance()
         else:
@@ -239,8 +291,6 @@ class DJBot(BaseBot):
         for line in lines:
             await self.highrise.chat(line)
 
-    # ---------- Playback ----------
-
     async def _advance(self) -> None:
         async with self._lock:
             if self.player.stop_requested:
@@ -252,14 +302,12 @@ class DJBot(BaseBot):
                 return
             track = self.player.queue.pop(0)
             self.player.current = track
-
         await self.highrise.chat(f"Now playing: {track.display()}")
         self.player.play_task = asyncio.create_task(self._play_track(track))
 
     async def _play_track(self, track: Track) -> None:
         ffmpeg_cmd = self._ffmpeg_cmd(track)
         curl_cmd = self._curl_cmd(track)
-
         try:
             ffmpeg_proc = await asyncio.create_subprocess_exec(
                 *ffmpeg_cmd,
@@ -295,9 +343,7 @@ class DJBot(BaseBot):
         ff_err_task = asyncio.create_task(drain(ffmpeg_proc.stderr))  # type: ignore[arg-type]
         curl_err_task = asyncio.create_task(drain(curl_proc.stderr))  # type: ignore[arg-type]
 
-        # Wait for curl (the uploader) to finish — when it exits, the upload is done.
         curl_rc = await curl_proc.wait()
-        # Make sure ffmpeg also stops (it usually exits when its stdout pipe closes).
         if ffmpeg_proc.returncode is None:
             try:
                 ffmpeg_proc.terminate()
@@ -311,6 +357,7 @@ class DJBot(BaseBot):
                 except ProcessLookupError:
                     pass
                 await ffmpeg_proc.wait()
+
         ff_rc = ffmpeg_proc.returncode
         ff_err = await ff_err_task
         curl_err = await curl_err_task
@@ -323,11 +370,14 @@ class DJBot(BaseBot):
                 self.player.current = None
 
         if not self.player.stop_requested:
-            failed = curl_rc not in (0,) or (ff_rc not in (0, -9, -15) and ff_rc is not None)
-            # ffmpeg exit codes: 0 = ok, -9 = SIGKILL (we killed it), -15 = SIGTERM
+            failed = curl_rc not in (0,) or (
+                ff_rc not in (0, -9, -15) and ff_rc is not None
+            )
             if failed:
-                tail = (curl_err.decode(errors="replace").strip().splitlines()
-                        or ff_err.decode(errors="replace").strip().splitlines())
+                tail = (
+                    curl_err.decode(errors="replace").strip().splitlines()
+                    or ff_err.decode(errors="replace").strip().splitlines()
+                )
                 last = tail[-1] if tail else f"curl rc={curl_rc}, ffmpeg rc={ff_rc}"
                 print(f"[stream] track failed: {last}")
                 await self.highrise.chat(f"Stream error on '{track.title}', skipping.")
@@ -368,11 +418,10 @@ class DJBot(BaseBot):
             "-ar", "44100",
             "-ac", "2",
             "-f", "mp3",
-            "-",  # write MP3 to stdout
+            "-",
         ]
 
     def _curl_cmd(self, track: Track) -> list[str]:
-        # Pull -u user:pass at runtime — never embed in URL we pass to argv that's logged.
         return [
             "curl",
             "--silent",
@@ -380,37 +429,50 @@ class DJBot(BaseBot):
             "--fail",
             "--user", f"{self.target.user}:{self.target.password}",
             "--header", "Content-Type: audio/mpeg",
-            "--header", f"Ice-Name: DJ Bot",
+            "--header", "Ice-Name: DJ Bot",
             "--header", "Ice-Description: " + _safe_header(track.title)[:120],
             "--header", "Ice-Public: 1",
             "--header", "Expect:",
             "--request", "PUT",
-            "--upload-file", "-",  # stream from stdin (chunked)
+            "--upload-file", "-",
             self.target.http_url,
         ]
 
 
 def run() -> None:
-    token = os.environ.get("HIGHRISE_BOT_TOKEN")
-    room_id = os.environ.get("HIGHRISE_ROOM_ID")
-    source_url = os.environ.get("ZENO_SOURCE_URL")
-    if not token or not room_id:
-        raise SystemExit("HIGHRISE_BOT_TOKEN and HIGHRISE_ROOM_ID must be set.")
-    if not source_url:
-        raise SystemExit("ZENO_SOURCE_URL must be set (icecast://user:pass@host:port/mount).")
+    token = (
+        os.environ.get("HIGHRISE_TOKEN")
+        or os.environ.get("HIGHRISE_BOT_TOKEN")
+        or ""
+    ).strip()
+    room_id = (
+        os.environ.get("ROOM_ID")
+        or os.environ.get("HIGHRISE_ROOM_ID")
+        or ""
+    ).strip()
 
-    target = parse_icecast_url(source_url)
-    print(f"[bot] streaming to http://{target.host}:{target.port}{target.mount} as '{target.user}'")
+    if not token:
+        raise SystemExit(
+            "Bot token not set. Set HIGHRISE_TOKEN (or HIGHRISE_BOT_TOKEN)."
+        )
+    if not room_id:
+        raise SystemExit(
+            "Room ID not set. Set ROOM_ID (or HIGHRISE_ROOM_ID)."
+        )
+
+    target = build_target_from_env()
+    print(f"[bot] streaming to {target.http_url} as '{target.user}'")
+
     bot = DJBot(target=target)
     definitions = [BotDefinition(bot, room_id, token)]
+
     while True:
         try:
             asyncio.run(highrise_main(definitions))
         except KeyboardInterrupt:
             break
         except Exception as exc:
-            print(f"[bot] disconnected: {exc!r} - reconnecting in 5s")
-            import time
+            print(f"[bot] disconnected: {exc!r} — reconnecting in 5s")
             time.sleep(5)
 
 
